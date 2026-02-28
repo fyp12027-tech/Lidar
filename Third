@@ -1,0 +1,355 @@
+import serial
+import time
+import math
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
+from sklearn.cluster import DBSCAN
+from datetime import datetime
+from collections import defaultdict, deque
+
+# ══════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ══════════════════════════════════════════════════════════════
+PORT              = 'COM7'
+BAUD              = 115200
+MAX_DIST_MM       = 6000
+MIN_DIST_MM       = 50
+MIN_QUALITY       = 8
+DBSCAN_EPS        = 200
+DBSCAN_MIN_POINTS = 5
+SIZE_SMALL_MAX    = 400
+SIZE_MEDIUM_MAX   = 1200
+KEEP_SCANS        = 25        # how many scans to accumulate on map
+AUTO_SAVE         = True
+# ══════════════════════════════════════════════════════════════
+
+# ── Connect ────────────────────────────────────────────────────
+try:
+    ser = serial.Serial(PORT, BAUD, timeout=1)
+    time.sleep(2)
+    print(f"✅ Connected to {PORT}")
+except serial.SerialException as e:
+    print(f"❌ {e}"); exit()
+
+# ── State ──────────────────────────────────────────────────────
+scan_id      = 0
+scan_buffer  = []
+# Rolling window of accumulated point clouds
+all_points   = deque(maxlen=KEEP_SCANS)   # each entry: list of (x, y)
+latest_clust = {'clusters': {}, 'centers': {}, 'labels': {}}
+scan_rate_times = deque(maxlen=10)
+stats = {'scans': 0, 'rpm': 0.0, 'hz': 0.0, 'objects': 0, 'pts': 0}
+
+# ══════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════
+def parse_line(line):
+    try:
+        p = line.strip().split(',')
+        if len(p) == 4:
+            return float(p[0]), float(p[1]), int(p[2]), int(p[3])
+    except: pass
+    return None
+
+def polar_to_xy(angle_deg, dist_mm):
+    r = math.radians(angle_deg)
+    return dist_mm * math.cos(r), dist_mm * math.sin(r)
+
+def classify(width):
+    if width < SIZE_SMALL_MAX:  return "Small",  '#FF4444'
+    if width < SIZE_MEDIUM_MAX: return "Medium", '#FFD700'
+    return                             "Large",   '#44AAFF'
+
+# ══════════════════════════════════════════════════════════════
+#  PROCESS SCAN
+# ══════════════════════════════════════════════════════════════
+def process_scan(buf):
+    global scan_id
+    scan_id += 1
+    now = time.time()
+    scan_rate_times.append(now)
+
+    # Compute Hz and RPM
+    if len(scan_rate_times) >= 2:
+        elapsed = scan_rate_times[-1] - scan_rate_times[0]
+        hz  = (len(scan_rate_times) - 1) / elapsed if elapsed > 0 else 0
+        rpm = hz * 60
+        stats['hz']  = hz
+        stats['rpm'] = rpm
+
+    # Filter points
+    filt = []
+    for b in buf:
+        angle, dist, quality = b[0], b[1], b[2]
+        if quality >= MIN_QUALITY and MIN_DIST_MM <= dist <= MAX_DIST_MM:
+            x, y = polar_to_xy(angle, dist)
+            filt.append((x, y))
+
+    stats['scans'] += 1
+    stats['pts']    = len(filt)
+
+    if not filt:
+        return
+
+    all_points.append(filt)
+
+    # DBSCAN on current scan only
+    clusters, centers, labels = {}, {}, {}
+    if len(filt) >= DBSCAN_MIN_POINTS:
+        xy = np.array(filt)
+        db = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_POINTS).fit(xy)
+        clmap = defaultdict(list)
+        for i, lbl in enumerate(db.labels_):
+            if lbl != -1:
+                clmap[lbl].append(i)
+
+        stats['objects'] = len(clmap)
+        print(f"  Scan #{scan_id}  {len(filt)}pts  "
+              f"{len(clmap)} obj  {stats['hz']:.1f}Hz  {stats['rpm']:.0f}RPM")
+
+        for cid, idxs in clmap.items():
+            arr    = xy[idxs]
+            cx, cy = arr[:,0].mean(), arr[:,1].mean()
+            dist_m = math.sqrt(cx**2 + cy**2) / 1000
+            width  = max(arr[:,0].max()-arr[:,0].min(),
+                         arr[:,1].max()-arr[:,1].min())
+            angle  = math.degrees(math.atan2(cy, cx)) % 360
+            otype, col = classify(width)
+            clusters[cid] = [filt[i] for i in idxs]
+            centers[cid]  = (cx, cy)
+            labels[cid]   = (otype, dist_m, angle, col, arr)
+
+    latest_clust['clusters'] = clusters
+    latest_clust['centers']  = centers
+    latest_clust['labels']   = labels
+
+# ══════════════════════════════════════════════════════════════
+#  FIGURE — mimics RoboStudio style
+# ══════════════════════════════════════════════════════════════
+plt.ion()
+fig = plt.figure(figsize=(12, 10), facecolor='#050A08')
+fig.canvas.manager.set_window_title("RPLidar — Live Map")
+
+ax = fig.add_axes([0.0, 0.0, 1.0, 1.0])
+ax.set_facecolor('#050A08')
+ax.set_aspect('equal')
+ax.axis('off')
+
+# Dynamic limits — will auto-expand
+view_range = [MAX_DIST_MM]
+
+def set_view(r):
+    ax.set_xlim(-r, r)
+    ax.set_ylim(-r, r)
+
+set_view(MAX_DIST_MM)
+
+# Draw static grid lines (faint, like RoboStudio)
+def draw_grid(r):
+    step = 1000
+    for v in range(-int(r), int(r)+1, step):
+        ax.plot([-r, r], [v, v], color='#0A1A10', linewidth=0.4, zorder=0)
+        ax.plot([v, v], [-r, r], color='#0A1A10', linewidth=0.4, zorder=0)
+
+draw_grid(MAX_DIST_MM)
+
+# Range rings
+for ring_r in [1000, 2000, 3000, 4000, 5000, 6000]:
+    c = plt.Circle((0,0), ring_r, fill=False,
+                   color='#0C2018', linewidth=0.6, linestyle='--', zorder=1)
+    ax.add_patch(c)
+    ax.text(ring_r * 0.707 + 40, ring_r * 0.707 + 40,
+            f"{ring_r//1000}m", color='#0F3020',
+            fontsize=7, fontfamily='monospace', zorder=1)
+
+# Crosshair
+ax.axhline(0, color='#0C2018', linewidth=0.5, zorder=1)
+ax.axvline(0, color='#0C2018', linewidth=0.5, zorder=1)
+
+# Sensor dot
+ax.plot(0, 0, 'o', color='#00FFAA', markersize=8, zorder=20)
+ax.plot(0, 0, 'o', color='#00FFAA', markersize=20,
+        markerfacecolor='none', markeredgewidth=1.0,
+        alpha=0.3, zorder=19)
+
+# HUD text elements (top-left, like RoboStudio)
+hud_hz   = ax.text(0.01, 0.98, '', transform=ax.transAxes,
+                   color='#FF4444', fontsize=11,
+                   fontfamily='monospace', va='top', zorder=30)
+hud_scan = ax.text(0.01, 0.93, '', transform=ax.transAxes,
+                   color='#FF6644', fontsize=9,
+                   fontfamily='monospace', va='top', zorder=30)
+hud_pts  = ax.text(0.01, 0.89, '', transform=ax.transAxes,
+                   color='#884422', fontsize=8,
+                   fontfamily='monospace', va='top', zorder=30)
+
+# Scale bar bottom
+scale_bar = ax.text(0.5, 0.02, '', transform=ax.transAxes,
+                    color='#1A4A2A', fontsize=8,
+                    fontfamily='monospace', ha='center', zorder=30)
+
+# Bottom-right corner coords
+corner_txt = ax.text(0.99, 0.02, '', transform=ax.transAxes,
+                     color='#1A4A2A', fontsize=7,
+                     fontfamily='monospace', ha='right', zorder=30)
+
+# Dynamic artists
+dyn = []
+
+def clear_dyn():
+    for a in dyn:
+        try: a.remove()
+        except: pass
+    dyn.clear()
+
+# ══════════════════════════════════════════════════════════════
+#  REDRAW
+# ══════════════════════════════════════════════════════════════
+def redraw():
+    clear_dyn()
+
+    # ── Accumulated point cloud ────────────────────────────────
+    # Older scans = dimmer, newest = brightest cyan (like RoboStudio)
+    n = len(all_points)
+    for i, scan_pts in enumerate(all_points):
+        if not scan_pts: continue
+        brightness = (i + 1) / (n + 1)   # 0→1 old→new
+        alpha      = 0.15 + brightness * 0.75
+        size       = 1.5 + brightness * 3.0
+        # Teal/cyan color like RoboStudio, slightly brighter for newer
+        r = 0.0
+        g = 0.6 + brightness * 0.4
+        b = 0.5 + brightness * 0.5
+        color = (r, g, b)
+
+        xs = [p[0] for p in scan_pts]
+        ys = [p[1] for p in scan_pts]
+        sc = ax.scatter(xs, ys, s=size, c=[color],
+                        alpha=alpha, zorder=3, linewidths=0)
+        dyn.append(sc)
+
+    # ── Object bounding boxes + labels ────────────────────────
+    for cid, lbl in latest_clust['labels'].items():
+        otype, dist_m, angle, col, arr = lbl
+        cx, cy = latest_clust['centers'][cid]
+
+        xmin,xmax = arr[:,0].min(), arr[:,0].max()
+        ymin,ymax = arr[:,1].min(), arr[:,1].max()
+        pad = 60
+
+        # Box glow layers
+        for lw, al in [(8, 0.04), (3, 0.12), (1.2, 1.0)]:
+            rect = plt.Rectangle(
+                (xmin-pad, ymin-pad),
+                (xmax-xmin)+2*pad, (ymax-ymin)+2*pad,
+                linewidth=lw, edgecolor=col,
+                facecolor='none', alpha=al, zorder=6)
+            ax.add_patch(rect)
+            dyn.append(rect)
+
+        # Corner ticks (like RoboStudio)
+        tick_len = 80
+        corners = [
+            (xmin-pad, ymin-pad, tick_len, 0),
+            (xmin-pad, ymin-pad, 0, tick_len),
+            (xmax+pad, ymin-pad, -tick_len, 0),
+            (xmax+pad, ymin-pad, 0, tick_len),
+            (xmin-pad, ymax+pad, tick_len, 0),
+            (xmin-pad, ymax+pad, 0, -tick_len),
+            (xmax+pad, ymax+pad, -tick_len, 0),
+            (xmax+pad, ymax+pad, 0, -tick_len),
+        ]
+        for x0,y0,dx,dy in corners:
+            ln, = ax.plot([x0, x0+dx],[y0, y0+dy],
+                          color=col, linewidth=1.8,
+                          alpha=0.9, zorder=7)
+            dyn.append(ln)
+
+        # Label — RoboStudio style: type + distance stacked
+        lbl_x = cx
+        lbl_y = ymax + pad + 50
+
+        # Background pill
+        bg = FancyBboxPatch(
+            (lbl_x - 220, lbl_y),
+            440, 120,
+            boxstyle="round,pad=8",
+            linewidth=1.0, edgecolor=col,
+            facecolor='#050A08', alpha=0.92, zorder=8)
+        ax.add_patch(bg)
+        dyn.append(bg)
+
+        t1 = ax.text(lbl_x, lbl_y + 90, otype.upper(),
+                     color=col, fontsize=8.5, ha='center', va='top',
+                     fontweight='bold', fontfamily='monospace', zorder=9)
+        t2 = ax.text(lbl_x, lbl_y + 45,
+                     f"◎ {dist_m:.2f} m    {angle:.0f}°",
+                     color='#AAFFCC', fontsize=8, ha='center', va='top',
+                     fontfamily='monospace', zorder=9)
+        dyn.extend([t1, t2])
+
+    # ── HUD update ─────────────────────────────────────────────
+    hud_hz.set_text(
+        f"{stats['hz']:.1f} Hz ({stats['rpm']:.0f} RPM)")
+    hud_scan.set_text(
+        f"SCAN #{stats['scans']:04d}    OBJECTS: {stats['objects']}")
+    hud_pts.set_text(
+        f"POINTS: {stats['pts']}    RANGE: {MAX_DIST_MM//1000}m")
+    scale_bar.set_text(
+        f"◄─── 1 m ───►    grid = 1m")
+    corner_txt.set_text(
+        f"{datetime.now().strftime('%H:%M:%S')}")
+
+    fig.canvas.draw()
+    fig.canvas.flush_events()
+
+    if AUTO_SAVE and stats['scans'] % 15 == 0:
+        fig.savefig('lidar_snapshot.png', dpi=120,
+                    bbox_inches='tight', facecolor='#050A08')
+
+# ══════════════════════════════════════════════════════════════
+#  MAIN LOOP
+# ══════════════════════════════════════════════════════════════
+print("\n🚀 RPLidar live map started!")
+print("   Points accumulate scan by scan — just like RoboStudio.")
+print("   Close window or Ctrl+C to stop.\n")
+
+plt.show(block=False)
+plt.pause(0.3)
+
+try:
+    while plt.fignum_exists(fig.number):
+        while ser.in_waiting:
+            try:
+                raw    = ser.readline().decode('utf-8', errors='ignore')
+                result = parse_line(raw)
+                if not result:
+                    continue
+                angle, dist, quality, start_bit = result
+
+                if start_bit == 1 and len(scan_buffer) > 10:
+                    process_scan(scan_buffer)
+                    redraw()
+                    scan_buffer.clear()
+
+                scan_buffer.append((angle, dist, quality))
+
+            except Exception as e:
+                print(f"Read error: {e}")
+
+        plt.pause(0.01)
+
+except KeyboardInterrupt:
+    print("\n🛑 Stopped.")
+
+finally:
+    ser.close()
+    fig.savefig('lidar_final_map.png', dpi=150,
+                bbox_inches='tight', facecolor='#050A08')
+    print("✅ Serial closed.")
+    print("✅ Final map saved → lidar_final_map.png")
+    plt.ioff()
+    input("\n  Press Enter to close the window...")
