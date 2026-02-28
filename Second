@@ -1,0 +1,403 @@
+import serial
+import time
+import math
+import csv
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')          # ← Forces a real window in PyCharm
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.gridspec import GridSpec
+from sklearn.cluster import DBSCAN
+from datetime import datetime
+from collections import defaultdict
+
+# ══════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ══════════════════════════════════════════════════════════════
+PORT         = 'COM7'
+BAUD         = 115200
+MAX_DIST_MM  = 3000       # view range (mm)
+MIN_DIST_MM  = 50
+MIN_QUALITY  = 10
+
+DBSCAN_EPS        = 150
+DBSCAN_MIN_POINTS = 5
+
+SIZE_SMALL_MAX    = 400
+SIZE_MEDIUM_MAX   = 1000
+
+OUTPUT_CSV = "lidar_data.csv"
+# ══════════════════════════════════════════════════════════════
+
+COLORS = ['#00FF88','#FF6B6B','#FFD93D','#6BCBFF',
+          '#FF8CFF','#FF9A3C','#A8FF3E','#FF4D8F']
+
+# ── Connect ────────────────────────────────────────────────────
+try:
+    ser = serial.Serial(PORT, BAUD, timeout=1)
+    time.sleep(2)
+    print(f"✅ Connected to {PORT}")
+except serial.SerialException as e:
+    print(f"❌ Connection failed: {e}")
+    exit()
+
+# ── CSV ────────────────────────────────────────────────────────
+csv_file   = open(OUTPUT_CSV, mode='w', newline='')
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow(['timestamp','scan_id','angle_deg','distance_mm',
+                     'quality','x_mm','y_mm','cluster_id',
+                     'object_type','distance_m'])
+print(f"📁 Saving to: {OUTPUT_CSV}")
+
+# ── State ──────────────────────────────────────────────────────
+scan_id     = 0
+scan_buffer = []   # [(x,y,angle,dist,quality), ...]
+
+# What the 4 panels will draw
+state = {
+    # Panel 1 — RAW (no filter)
+    'raw_xs': [], 'raw_ys': [],
+
+    # Panel 2 — FILTERED
+    'filt_xs': [], 'filt_ys': [],
+
+    # Panel 3 — CLUSTERED
+    'clusters': {}, 'centers': {}, 'labels': {},
+
+    # Panel 4 — POLAR
+    'polar_angles': [], 'polar_dists': [],
+
+    'scan_id': 0,
+}
+
+# ══════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════
+def parse_line(line):
+    try:
+        p = line.strip().split(',')
+        if len(p) == 4:
+            return float(p[0]), float(p[1]), int(p[2]), int(p[3])
+    except:
+        pass
+    return None
+
+def polar_to_xy(angle_deg, dist_mm):
+    r = math.radians(angle_deg)
+    return dist_mm * math.cos(r), dist_mm * math.sin(r)
+
+def classify(width):
+    if width < SIZE_SMALL_MAX:  return "Small Object"
+    if width < SIZE_MEDIUM_MAX: return "Medium Object"
+    return "Large Surface"
+
+def process_scan(buf):
+    global scan_id
+    scan_id += 1
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+    raw_all  = [(polar_to_xy(b[2], b[3]), b[2], b[3], b[4]) for b in buf]
+    filt_pts = [(polar_to_xy(b[2], b[3]), b[2], b[3], b[4])
+                for b in buf
+                if b[4] >= MIN_QUALITY
+                and MIN_DIST_MM <= b[3] <= MAX_DIST_MM]
+
+    # Raw
+    state['raw_xs'] = [r[0][0] for r in raw_all]
+    state['raw_ys'] = [r[0][1] for r in raw_all]
+
+    # Filtered
+    state['filt_xs'] = [f[0][0] for f in filt_pts]
+    state['filt_ys'] = [f[0][1] for f in filt_pts]
+
+    # Polar (filtered)
+    state['polar_angles'] = [math.radians(f[1]) for f in filt_pts]
+    state['polar_dists']  = [f[2] for f in filt_pts]
+
+    # Clustering
+    clusters, centers, labels = {}, {}, {}
+    if len(filt_pts) >= DBSCAN_MIN_POINTS:
+        pts_xy = np.array([[f[0][0], f[0][1]] for f in filt_pts])
+        db     = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_POINTS).fit(pts_xy)
+        clmap  = defaultdict(list)
+        for i, lbl in enumerate(db.labels_):
+            if lbl != -1:
+                clmap[lbl].append(i)
+
+        print(f"\n── Scan #{scan_id}  raw={len(raw_all)} pts  "
+              f"filtered={len(filt_pts)} pts  objects={len(clmap)} ──")
+
+        for cid, idxs in clmap.items():
+            arr  = pts_xy[idxs]
+            cx, cy = arr[:,0].mean(), arr[:,1].mean()
+            dist_m = math.sqrt(cx**2+cy**2)/1000
+            width  = max(arr[:,0].max()-arr[:,0].min(),
+                         arr[:,1].max()-arr[:,1].min())
+            otype  = classify(width)
+            angle  = math.degrees(math.atan2(cy,cx)) % 360
+
+            clusters[cid] = [filt_pts[i][0] for i in idxs]
+            centers[cid]  = (cx, cy)
+            labels[cid]   = f"{otype}\n{dist_m:.2f} m"
+
+            print(f"  ▸ {otype}  |  {dist_m:.2f} m  "
+                  f"|  {angle:.1f}°  |  w={int(width)} mm")
+
+            # CSV
+            for i in idxs:
+                x, y = filt_pts[i][0]
+                csv_writer.writerow([
+                    ts, scan_id,
+                    round(filt_pts[i][1],2), round(filt_pts[i][2],1),
+                    filt_pts[i][3],
+                    round(x,1), round(y,1),
+                    cid, otype, round(dist_m,3)
+                ])
+        csv_file.flush()
+
+    state['clusters'] = clusters
+    state['centers']  = centers
+    state['labels']   = labels
+    state['scan_id']  = scan_id
+
+# ══════════════════════════════════════════════════════════════
+#  PLOT SETUP  — 4 panels
+# ══════════════════════════════════════════════════════════════
+plt.ion()   # interactive mode ON — window stays open while code runs
+
+fig = plt.figure(figsize=(18, 9), facecolor='#080810')
+fig.canvas.manager.set_window_title("LiDAR Live Monitor")
+
+gs = GridSpec(2, 4, figure=fig,
+              left=0.04, right=0.98,
+              top=0.91,  bottom=0.07,
+              wspace=0.35, hspace=0.45)
+
+# Panel 1 — RAW
+ax_raw = fig.add_subplot(gs[:, 0])
+ax_raw.set_facecolor('#080810')
+ax_raw.set_title("① RAW\n(no filter)", color='#FF8888',
+                  fontsize=10, fontweight='bold')
+
+# Panel 2 — FILTERED
+ax_filt = fig.add_subplot(gs[:, 1])
+ax_filt.set_facecolor('#080810')
+ax_filt.set_title("② FILTERED\n(quality>10, 50–3000mm)", color='#88FF88',
+                   fontsize=10, fontweight='bold')
+
+# Panel 3 — OBJECT DETECTION MAP
+ax_map = fig.add_subplot(gs[:, 2])
+ax_map.set_facecolor('#080810')
+ax_map.set_title("③ OBJECT DETECTION\n(DBSCAN clusters)", color='#88CCFF',
+                  fontsize=10, fontweight='bold')
+
+# Panel 4 — POLAR (top-right)
+ax_pol = fig.add_subplot(gs[0, 3], projection='polar')
+ax_pol.set_facecolor('#080810')
+ax_pol.set_title("④ POLAR VIEW", color='#FFDD88',
+                  fontsize=10, fontweight='bold', pad=10)
+
+# Info box (bottom-right)
+ax_info = fig.add_subplot(gs[1, 3])
+ax_info.set_facecolor('#080810')
+ax_info.axis('off')
+
+fig.suptitle("LiDAR Live — Before Filter | After Filter | Object Detection | Polar",
+             color='white', fontsize=12, fontweight='bold')
+
+def style_cartesian(ax, title_color):
+    ax.set_xlim(-MAX_DIST_MM, MAX_DIST_MM)
+    ax.set_ylim(-MAX_DIST_MM, MAX_DIST_MM)
+    ax.set_aspect('equal')
+    ax.grid(True, color='#131325', linewidth=0.5)
+    ax.axhline(0, color='#1E1E3A', linewidth=0.7)
+    ax.axvline(0, color='#1E1E3A', linewidth=0.7)
+    ax.tick_params(colors='#334455', labelsize=7)
+    ax.spines[:].set_color('#1A1A30')
+    for r in [500, 1000, 1500, 2000, 2500, 3000]:
+        c = plt.Circle((0,0), r, fill=False, color='#111128',
+                        linewidth=0.6, linestyle='--')
+        ax.add_patch(c)
+        ax.text(r+30, 30, f"{r//1000 if r>=1000 else r}{'m' if r>=1000 else 'mm'}",
+                color='#1E2E3E', fontsize=6)
+
+style_cartesian(ax_raw,  '#FF8888')
+style_cartesian(ax_filt, '#88FF88')
+style_cartesian(ax_map,  '#88CCFF')
+
+# Sensor triangles
+for ax in [ax_raw, ax_filt, ax_map]:
+    ax.plot(0, 0, '^', color='#FF3333', markersize=10, zorder=10)
+
+# Dynamic artist storage
+dyn = {'raw':[], 'filt':[], 'map':[], 'pol':[], 'info':[]}
+
+def clear_dyn(key):
+    for a in dyn[key]:
+        try: a.remove()
+        except: pass
+    dyn[key].clear()
+
+# ══════════════════════════════════════════════════════════════
+#  DRAW FUNCTION
+# ══════════════════════════════════════════════════════════════
+def redraw():
+    # ── Panel 1: RAW ──────────────────────────────────────────
+    clear_dyn('raw')
+    if state['raw_xs']:
+        sc = ax_raw.scatter(state['raw_xs'], state['raw_ys'],
+                            s=3, c='#FF4444', alpha=0.6, zorder=3)
+        dyn['raw'].append(sc)
+        t = ax_raw.text(-MAX_DIST_MM+80, MAX_DIST_MM-200,
+                        f"{len(state['raw_xs'])} pts\n(unfiltered)",
+                        color='#FF8888', fontsize=8,
+                        bbox=dict(facecolor='#100810',edgecolor='#441111',
+                                  boxstyle='round,pad=0.4'))
+        dyn['raw'].append(t)
+
+    # ── Panel 2: FILTERED ─────────────────────────────────────
+    clear_dyn('filt')
+    if state['filt_xs']:
+        sc = ax_filt.scatter(state['filt_xs'], state['filt_ys'],
+                             s=3, c='#00FF88', alpha=0.7, zorder=3)
+        dyn['filt'].append(sc)
+        removed = len(state['raw_xs']) - len(state['filt_xs'])
+        t = ax_filt.text(-MAX_DIST_MM+80, MAX_DIST_MM-200,
+                         f"{len(state['filt_xs'])} pts kept\n"
+                         f"{removed} pts removed",
+                         color='#88FF88', fontsize=8,
+                         bbox=dict(facecolor='#081008',edgecolor='#114411',
+                                   boxstyle='round,pad=0.4'))
+        dyn['filt'].append(t)
+
+    # ── Panel 3: OBJECT DETECTION ─────────────────────────────
+    clear_dyn('map')
+    if state['filt_xs']:
+        sc = ax_map.scatter(state['filt_xs'], state['filt_ys'],
+                            s=2, c='#1A3A5A', alpha=0.4, zorder=2)
+        dyn['map'].append(sc)
+
+    for idx, (cid, pts) in enumerate(state['clusters'].items()):
+        col = COLORS[idx % len(COLORS)]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        sc = ax_map.scatter(xs, ys, s=8, c=col, zorder=4, alpha=0.95)
+        dyn['map'].append(sc)
+
+        arr  = np.array(pts)
+        xmin,xmax = arr[:,0].min(), arr[:,0].max()
+        ymin,ymax = arr[:,1].min(), arr[:,1].max()
+        pad = 50
+        rect = mpatches.FancyBboxPatch(
+            (xmin-pad, ymin-pad), (xmax-xmin)+2*pad, (ymax-ymin)+2*pad,
+            boxstyle="round,pad=0", linewidth=1.8,
+            edgecolor=col, facecolor=col, alpha=0.08, zorder=3)
+        ax_map.add_patch(rect)
+        dyn['map'].append(rect)
+
+        cx, cy = state['centers'][cid]
+        ln, = ax_map.plot([0,cx],[0,cy], color=col,
+                          linewidth=0.9, alpha=0.35,
+                          linestyle='--', zorder=2)
+        dyn['map'].append(ln)
+
+        txt = ax_map.text(cx, cy+120,
+                          state['labels'].get(cid,''),
+                          color=col, fontsize=8, ha='center',
+                          bbox=dict(boxstyle='round,pad=0.3',
+                                    facecolor='#08080F',
+                                    edgecolor=col, alpha=0.9),
+                          zorder=6)
+        dyn['map'].append(txt)
+
+    n_obj = len(state['clusters'])
+    t = ax_map.text(-MAX_DIST_MM+80, MAX_DIST_MM-200,
+                    f"Objects: {n_obj}",
+                    color='#88CCFF', fontsize=9, fontweight='bold',
+                    bbox=dict(facecolor='#080C14',edgecolor='#224466',
+                              boxstyle='round,pad=0.4'))
+    dyn['map'].append(t)
+
+    # ── Panel 4: POLAR ────────────────────────────────────────
+    clear_dyn('pol')
+    ax_pol.clear()
+    ax_pol.set_facecolor('#080810')
+    ax_pol.set_title("④ POLAR VIEW", color='#FFDD88',
+                     fontsize=10, fontweight='bold', pad=10)
+    ax_pol.tick_params(colors='#445566', labelsize=7)
+    if state['polar_angles']:
+        sc = ax_pol.scatter(state['polar_angles'], state['polar_dists'],
+                            s=3, c='#FFD93D', alpha=0.8)
+        ax_pol.set_ylim(0, MAX_DIST_MM)
+
+    # ── Info box ──────────────────────────────────────────────
+    clear_dyn('info')
+    ax_info.clear()
+    ax_info.axis('off')
+    ax_info.set_facecolor('#080810')
+    info = (f"  Scan #:       {state['scan_id']}\n"
+            f"  Raw pts:      {len(state['raw_xs'])}\n"
+            f"  Filtered pts: {len(state['filt_xs'])}\n"
+            f"  Objects:      {len(state['clusters'])}\n\n"
+            f"  ■ Red   = raw unfiltered\n"
+            f"  ■ Green = after filter\n"
+            f"  ■ Color = detected object\n"
+            f"  ▲ Red triangle = LiDAR")
+    t = ax_info.text(0.05, 0.95, info,
+                     transform=ax_info.transAxes,
+                     color='white', fontsize=8.5, va='top',
+                     fontfamily='monospace',
+                     bbox=dict(facecolor='#0D0D1A',edgecolor='#223344',
+                               boxstyle='round,pad=0.6'))
+    dyn['info'].append(t)
+
+    fig.canvas.draw()
+    fig.canvas.flush_events()
+
+# ══════════════════════════════════════════════════════════════
+#  MAIN LOOP
+# ══════════════════════════════════════════════════════════════
+print("\n🚀 Live map is running! Watch the 4 panels update in real time.")
+print("   Close the plot window OR press Ctrl+C in terminal to stop.\n")
+
+plt.show(block=False)   # Open window immediately without blocking
+
+try:
+    while plt.fignum_exists(fig.number):   # keep going until window closed
+        # Read all available serial lines
+        lines_read = 0
+        while ser.in_waiting and lines_read < 50:
+            try:
+                raw    = ser.readline().decode('utf-8', errors='ignore')
+                result = parse_line(raw)
+                if not result:
+                    continue
+                angle, distance, quality, start_bit = result
+                lines_read += 1
+
+                # New scan starts → process previous buffer
+                if start_bit == 1 and len(scan_buffer) > 10:
+                    process_scan(scan_buffer)
+                    redraw()
+                    scan_buffer.clear()
+
+                # Always store raw point
+                x, y = polar_to_xy(angle, distance)
+                scan_buffer.append((x, y, angle, distance, quality))
+
+            except Exception as e:
+                print(f"Read error: {e}")
+
+        plt.pause(0.05)   # Let the GUI breathe (keeps window responsive)
+
+except KeyboardInterrupt:
+    print("\n🛑 Stopped by user.")
+
+finally:
+    ser.close()
+    csv_file.close()
+    print(f"✅ Serial closed.")
+    print(f"✅ CSV saved → {OUTPUT_CSV}")
+    plt.ioff()
+    plt.show(block=True)   # Keep window open after stopping
