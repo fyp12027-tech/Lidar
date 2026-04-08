@@ -9,4 +9,4 @@ This module is developed to identify structural fractures on surfaces using Deep
 
 ##  Folder Contents
 - `Crack_Detection_Model.ipynb`: The full training and testing code (Click "Download" if the preview doesn't load).
-- `best.pt`: (Coming soon) Trained weights for the crack model.
+- `best.pt`:Trained weights for the crack model.
