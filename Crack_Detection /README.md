@@ -11,7 +11,7 @@ This module is a core component of our multi-sensor suite, designed to identify 
 
 ##  Folder Contents
 - `Crack_Detection_Model.ipynb`: Full training pipeline and inference logs.
-- `best.pt`:Model weights for integration.
+- `best_crack.pt`:Model weights for integration.
 
 ##  Status
 The training environment and dataset mapping are fully configured. Initial tests show successful detection of surface fractures across various lighting conditions.
